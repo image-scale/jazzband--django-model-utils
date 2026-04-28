@@ -81,6 +81,17 @@ class TimeFramedModel(models.Model):
         abstract = True
 
 
+class TimeFramedManager(models.Manager['TimeFramedModel']):
+    """Manager that filters to timeframed items (start <= now <= end)."""
+
+    def get_queryset(self) -> models.QuerySet['TimeFramedModel']:
+        now = timezone.now()
+        return super().get_queryset().filter(
+            (Q(start__lte=now) | Q(start__isnull=True)) &
+            (Q(end__gte=now) | Q(end__isnull=True))
+        )
+
+
 def _add_timeframed_manager(sender: type, **kwargs: Any) -> None:
     """Add the timeframed manager to TimeFramedModel subclasses."""
     if not issubclass(sender, TimeFramedModel):
@@ -88,23 +99,23 @@ def _add_timeframed_manager(sender: type, **kwargs: Any) -> None:
     if sender._meta.abstract:
         return
 
-    # Check for conflicts
-    if hasattr(sender, 'timeframed'):
-        existing = getattr(sender, 'timeframed')
-        if not isinstance(existing, QueryManager):
-            raise ImproperlyConfigured(
-                f"{sender.__name__} cannot define 'timeframed' as it conflicts "
-                "with TimeFramedModel's automatic manager."
-            )
-        return  # Already has a QueryManager
+    # Check for conflicts - look directly in class __dict__
+    for base in sender.__mro__:
+        if base is TimeFramedModel or base is models.Model:
+            continue
+        if 'timeframed' in base.__dict__:
+            existing = base.__dict__['timeframed']
+            if not isinstance(existing, (TimeFramedManager, QueryManager)):
+                raise ImproperlyConfigured(
+                    f"{sender.__name__} cannot define 'timeframed' as it conflicts "
+                    "with TimeFramedModel's automatic manager."
+                )
 
-    # Add the timeframed manager
-    timeframed_manager = QueryManager(
-        (Q(start__lte=timezone.now) | Q(start__isnull=True)) &
-        (Q(end__gte=timezone.now) | Q(end__isnull=True))
-    )
-    timeframed_manager.auto_created = True
-    sender.add_to_class('timeframed', timeframed_manager)
+    # Add the timeframed manager if not already present
+    if 'timeframed' not in sender.__dict__:
+        timeframed_manager = TimeFramedManager()
+        timeframed_manager.auto_created = True
+        sender.add_to_class('timeframed', timeframed_manager)
 
 
 models.signals.class_prepared.connect(_add_timeframed_manager)

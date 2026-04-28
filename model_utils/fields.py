@@ -25,10 +25,9 @@ def get_excerpt(content: str) -> str:
     for i, line in enumerate(lines):
         stripped = line.strip()
         if stripped == SPLIT_MARKER:
-            # Found marker on its own line
-            excerpt = '\n'.join(lines[:i]).rstrip()
-            if excerpt.endswith('\n'):
-                return excerpt
+            # Found marker on its own line - return everything before it
+            # Keep trailing newline if present
+            excerpt = '\n'.join(lines[:i])
             return excerpt
 
     # Check for split marker at start of a line (after paragraph break)
