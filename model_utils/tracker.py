@@ -14,12 +14,34 @@ ModelT = TypeVar("ModelT", bound=models.Model)
 def _copy_field_value(value: Any) -> Any:
     """Deep copy a field value, with special handling for FieldFile."""
     if isinstance(value, FieldFile):
-        # Don't copy the instance - it causes issues
+        # Create a copy of the FieldFile without copying the instance
+        # This avoids the expensive deepcopy of the model instance
+        if not value:
+            return None
+        # Get the state and remove the instance reference
         state = value.__getstate__()
         state['instance'] = None
-        new_file = FieldFile(None, value.field)
-        new_file.__setstate__(state)
-        return new_file
+        # Create a new FieldFile-like object that just stores the state
+        class FieldFileCopy:
+            def __init__(self, state: dict[str, Any], name: str) -> None:
+                self._state = state
+                self.name = name
+
+            def __getstate__(self) -> dict[str, Any]:
+                return self._state
+
+            def __eq__(self, other: Any) -> bool:
+                if isinstance(other, (FieldFile, FieldFileCopy)):
+                    return self.name == getattr(other, 'name', None)
+                return self.name == other
+
+            def __ne__(self, other: Any) -> bool:
+                return not self.__eq__(other)
+
+            def __bool__(self) -> bool:
+                return bool(self.name)
+
+        return FieldFileCopy(state, value.name)
     try:
         return copy.deepcopy(value)
     except Exception:
@@ -164,12 +186,11 @@ class FieldInstanceTracker:
                 if current != self.saved_data[field]:
                     result[field] = self.saved_data[field]
             elif self.instance.pk is None:
-                # New instance - field has changed from None
+                # New instance - field has changed from None if it has any value
                 current = self.get_field_value(field)
-                if current != '' and current is not None:
-                    result[field] = None
-                elif field == 'name' and current == '':
-                    # CharField with blank default
+                # For new instances, any non-None current value means changed from None
+                # Empty string counts as changed (e.g., for FileField or CharField)
+                if current is not None:
                     result[field] = None
         return result
 
