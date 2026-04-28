@@ -137,7 +137,15 @@ class MonitorField(models.DateTimeField):
 
     def contribute_to_class(self, cls: type, name: str, private_only: bool = False, **kwargs: Any) -> None:
         super().contribute_to_class(cls, name, private_only=private_only, **kwargs)
+        models.signals.post_init.connect(self._store_initial_value, sender=cls)
         models.signals.pre_save.connect(self._check_monitor, sender=cls)
+
+    def _store_initial_value(self, sender: type, instance: models.Model, **kwargs: Any) -> None:
+        """Store the initial value of the monitored field for new objects."""
+        if instance.pk is None:
+            # Store the initial value of the monitored field
+            initial_value = getattr(instance, self.monitor, None)
+            setattr(instance, f'_initial_{self.monitor}', initial_value)
 
     def _check_monitor(self, sender: type, instance: models.Model, raw: bool = False, **kwargs: Any) -> None:
         if raw:
@@ -152,8 +160,16 @@ class MonitorField(models.DateTimeField):
 
         # Check if this is a new object
         if instance.pk is None:
-            # New object - set if value matches when condition
+            # New object - compare against initial value
+            initial_attr = f'_initial_{self.monitor}'
+            initial_value = getattr(instance, initial_attr, None)
+
+            # For nullable fields, only update when value is None and condition met
             if self.null and getattr(instance, self.attname) is None:
+                if self.when is None or current_value in self.when:
+                    setattr(instance, self.attname, timezone.now())
+            # For non-nullable fields, update if value changed from initial
+            elif not self.null and current_value != initial_value:
                 if self.when is None or current_value in self.when:
                     setattr(instance, self.attname, timezone.now())
             return
