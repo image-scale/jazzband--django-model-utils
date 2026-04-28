@@ -170,9 +170,50 @@ class FieldInstanceTracker:
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        # Restore saved_data from before the context
+        # Pop the saved state
         if self._context_stack:
-            self.saved_data = self._context_stack.pop()
+            popped_state = self._context_stack.pop()
+            if not self._context_stack:
+                # Outermost context exit - update baseline to current values
+                self.set_saved_fields()
+            else:
+                # Nested context exit - restore to state at context entry
+                self.saved_data = popped_state
+
+    def __call__(self, *fields: str) -> FieldTrackerContextManager:
+        """Return a context manager that tracks specific fields."""
+        return FieldTrackerContextManager(self, fields if fields else None)
+
+
+class FieldTrackerContextManager:
+    """Context manager for field-specific tracking within FieldInstanceTracker."""
+
+    def __init__(self, tracker: FieldInstanceTracker, fields: tuple[str, ...] | Iterable[str] | None = None) -> None:
+        self.tracker = tracker
+        self.fields = set(fields) if fields else None
+        self._entered = False
+
+    def __enter__(self) -> FieldTrackerContextManager:
+        # Push the current saved_data state to the stack
+        self.tracker._context_stack.append(self.tracker.saved_data.copy())
+        self._entered = True
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if self.tracker._context_stack:
+            popped_state = self.tracker._context_stack.pop()
+            if not self.tracker._context_stack:
+                # Outermost context exit - update baseline to current values
+                if self.fields:
+                    # Only update specified fields
+                    for f in self.fields:
+                        if f in self.tracker.fields:
+                            self.tracker.saved_data[f] = _copy_field_value(self.tracker.get_field_value(f))
+                else:
+                    self.tracker.set_saved_fields()
+            else:
+                # Nested context exit - restore to state at context entry
+                self.tracker.saved_data = popped_state
 
 
 class FieldTracker:
@@ -263,26 +304,31 @@ class FieldTracker:
             else:
                 tracker.set_saved_fields()
 
-    def __call__(self, *fields: str) -> TrackerContextManager:
-        """Return a context manager that tracks specific fields."""
-        # This is called as a decorator or context manager
-        # When called on the class descriptor, we need to return something that
-        # can be used as a decorator
-        if self.model_class and len(fields) == 1 and callable(fields[0]):
+    def __call__(self, *args: Any, fields: Iterable[str] | None = None) -> Any:
+        """Return a decorator or context manager.
+
+        Can be used as:
+        - @Tracked.tracker - decorator with no arguments
+        - @Tracked.tracker(fields=['name']) - decorator with fields argument
+        """
+        # If called with a callable as first argument and no fields, it's a decorator
+        if len(args) == 1 and callable(args[0]) and fields is None:
             # Called as @Tracked.tracker with no arguments
-            func = fields[0]
+            func = args[0]
             @functools.wraps(func)
-            def wrapper(*args: Any, **kwargs: Any) -> Any:
-                if args:
-                    instance = args[0]
+            def wrapper(*wrapper_args: Any, **wrapper_kwargs: Any) -> Any:
+                if wrapper_args:
+                    instance = wrapper_args[0]
                     tracker = self.__get__(instance, type(instance))
                     if isinstance(tracker, FieldInstanceTracker):
                         with tracker:
-                            return func(*args, **kwargs)
-                return func(*args, **kwargs)
-            return wrapper  # type: ignore
-        # Return a TrackerContextManager-like object for use with instance
-        return TrackerDecorator(self, fields if fields else None)
+                            return func(*wrapper_args, **wrapper_kwargs)
+                return func(*wrapper_args, **wrapper_kwargs)
+            return wrapper
+
+        # Otherwise return a decorator that tracks specific fields
+        track_fields = list(fields) if fields else list(args) if args else None
+        return TrackerDecorator(self, tuple(track_fields) if track_fields else None)
 
 
 class TrackerDecorator:
@@ -299,7 +345,7 @@ class TrackerDecorator:
                 instance = args[0]
                 tracker_instance = self.tracker.__get__(instance, type(instance))
                 if isinstance(tracker_instance, FieldInstanceTracker):
-                    ctx = TrackerContextManager(tracker_instance, self.fields)
+                    ctx = FieldTrackerContextManager(tracker_instance, self.fields)
                     with ctx:
                         return func(*args, **kwargs)
             return func(*args, **kwargs)
