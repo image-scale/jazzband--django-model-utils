@@ -76,7 +76,16 @@ class FieldInstanceTracker:
     def get_field_value(self, field: str) -> Any:
         """Get the current value of a field."""
         if field in self.field_map:
-            # It's a real field
+            model_field = self.field_map[field]
+            # For FK fields accessed by name (not _id), avoid triggering a DB query
+            # by checking if the related object is cached in __dict__
+            if model_field and hasattr(model_field, 'is_relation') and model_field.is_relation:
+                if model_field.many_to_one or model_field.one_to_one:
+                    # Check if the object is cached (stored under field name in __dict__)
+                    if field in self.instance.__dict__:
+                        return self.instance.__dict__[field]
+                    # If not cached, return the FK id instead to avoid query
+                    return getattr(self.instance, model_field.attname, None)
             return getattr(self.instance, field)
         else:
             # It might be a property or attname (like fk_id)
@@ -285,7 +294,11 @@ class FieldTracker:
         else:
             # Track all fields
             for field in opts.fields:
-                self.field_map[field.name] = field
+                # For FK fields, use attname (e.g., 'fk_id') not name (e.g., 'fk')
+                if hasattr(field, 'attname') and field.attname != field.name:
+                    self.field_map[field.attname] = field
+                else:
+                    self.field_map[field.name] = field
 
         # Wrap descriptors for deferred field support
         for field_name, field in self.field_map.items():
@@ -297,12 +310,53 @@ class FieldTracker:
                     wrapper = DescriptorWrapper(field, f'_tracker_{self.attname}', field_name)
                     setattr(sender, field_name, wrapper)
 
+        # Wrap refresh_from_db to update saved_data after refresh
+        self._wrap_refresh_from_db(sender)
+
         # Connect to post_init signal to set initial saved_data
-        models.signals.post_init.connect(self.initialize_tracker, sender=sender)
+        # Use weak=False to prevent garbage collection of the handler
+        models.signals.post_init.connect(self.initialize_tracker, sender=sender, weak=False)
         # Connect to post_save signal to update saved_data
-        models.signals.post_save.connect(self._post_save, sender=sender)
-        # Connect to post_refresh_from_db to update saved_data
-        # This requires a custom approach since there's no built-in signal
+        models.signals.post_save.connect(self._post_save, sender=sender, weak=False)
+
+        # Also connect signals for subclasses by listening to class_prepared
+        # and connecting to each concrete subclass
+        models.signals.class_prepared.connect(
+            self._connect_subclass_signals, weak=False
+        )
+
+    def _connect_subclass_signals(self, sender: type, **kwargs: Any) -> None:
+        """Connect signals for subclasses of the tracked model."""
+        if self.model_class is None:
+            return
+        # Check if sender is a subclass of our model (but not the model itself)
+        if issubclass(sender, self.model_class) and sender is not self.model_class:
+            if not sender._meta.abstract:
+                # Connect signals for this subclass
+                models.signals.post_init.connect(self.initialize_tracker, sender=sender, weak=False)
+                models.signals.post_save.connect(self._post_save, sender=sender, weak=False)
+                # Also wrap refresh_from_db for the subclass
+                self._wrap_refresh_from_db(sender)
+
+    def _wrap_refresh_from_db(self, sender: type) -> None:
+        """Wrap refresh_from_db to update tracker after refresh."""
+        original_refresh = sender.refresh_from_db
+        tracker_descriptor = self
+
+        @functools.wraps(original_refresh)
+        def refresh_from_db_wrapper(self: models.Model, using: str | None = None, fields: list[str] | None = None, from_queryset: Any = None) -> None:
+            original_refresh(self, using=using, fields=fields, from_queryset=from_queryset)
+            # Update the tracker's saved_data for the refreshed fields
+            tracker = tracker_descriptor.__get__(self, type(self))
+            if isinstance(tracker, FieldInstanceTracker) and not tracker._context_stack:
+                if fields:
+                    # Only update the fields that were refreshed
+                    tracker.set_saved_fields(set(fields) & tracker.fields)
+                else:
+                    # All fields were refreshed
+                    tracker.set_saved_fields()
+
+        sender.refresh_from_db = refresh_from_db_wrapper  # type: ignore
 
     def initialize_tracker(self, sender: models.Model, instance: models.Model, **kwargs: Any) -> None:
         """Initialize the tracker on a new instance."""
