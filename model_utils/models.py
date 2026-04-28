@@ -80,39 +80,34 @@ class TimeFramedModel(models.Model):
     class Meta:
         abstract = True
 
-    @classmethod
-    def _check_timeframed_conflict(cls) -> None:
-        """Check for conflicting 'timeframed' attribute."""
-        if hasattr(cls, 'timeframed'):
-            attr = getattr(cls, 'timeframed')
-            # If it's not a QueryManager, there's a conflict
-            if not isinstance(attr, QueryManager):
-                raise ImproperlyConfigured(
-                    f"{cls.__name__} has a 'timeframed' attribute that conflicts "
-                    "with TimeFramedModel's automatic manager."
-                )
 
-    def __init_subclass__(cls, **kwargs: Any) -> None:
-        super().__init_subclass__(**kwargs)
-        if not cls._meta.abstract:
-            # Check for conflicts
-            for base in cls.__mro__:
-                if base is TimeFramedModel:
-                    continue
-                if hasattr(base, 'timeframed') and not isinstance(getattr(base, 'timeframed', None), QueryManager):
-                    for name, attr in base.__dict__.items():
-                        if name == 'timeframed' and not isinstance(attr, QueryManager):
-                            raise ImproperlyConfigured(
-                                f"{cls.__name__} cannot define 'timeframed' as it conflicts "
-                                "with TimeFramedModel's automatic manager."
-                            )
-            # Add the timeframed manager
-            timeframed_manager = QueryManager(
-                (Q(start__lte=timezone.now) | Q(start__isnull=True)) &
-                (Q(end__gte=timezone.now) | Q(end__isnull=True))
+def _add_timeframed_manager(sender: type, **kwargs: Any) -> None:
+    """Add the timeframed manager to TimeFramedModel subclasses."""
+    if not issubclass(sender, TimeFramedModel):
+        return
+    if sender._meta.abstract:
+        return
+
+    # Check for conflicts
+    if hasattr(sender, 'timeframed'):
+        existing = getattr(sender, 'timeframed')
+        if not isinstance(existing, QueryManager):
+            raise ImproperlyConfigured(
+                f"{sender.__name__} cannot define 'timeframed' as it conflicts "
+                "with TimeFramedModel's automatic manager."
             )
-            timeframed_manager.auto_created = True
-            cls.add_to_class('timeframed', timeframed_manager)
+        return  # Already has a QueryManager
+
+    # Add the timeframed manager
+    timeframed_manager = QueryManager(
+        (Q(start__lte=timezone.now) | Q(start__isnull=True)) &
+        (Q(end__gte=timezone.now) | Q(end__isnull=True))
+    )
+    timeframed_manager.auto_created = True
+    sender.add_to_class('timeframed', timeframed_manager)
+
+
+models.signals.class_prepared.connect(_add_timeframed_manager)
 
 
 class StatusModel(models.Model):
@@ -124,40 +119,6 @@ class StatusModel(models.Model):
     class Meta:
         abstract = True
 
-    def __init_subclass__(cls, **kwargs: Any) -> None:
-        super().__init_subclass__(**kwargs)
-        if not cls._meta.abstract:
-            # Add managers for each status choice
-            status_choices = getattr(cls, 'STATUS', None)
-            if status_choices is not None:
-                for choice in status_choices:
-                    if isinstance(choice, tuple) and len(choice) >= 2:
-                        # Get the status value (first element)
-                        status_value = choice[0]
-                        # For option groups, skip
-                        if isinstance(choice[1], (list, tuple)) and not isinstance(choice[1], str):
-                            continue
-                        # Get the identifier (status value or second element for 3-tuples)
-                        if len(choice) == 3:
-                            identifier = str(choice[1])
-                            status_value = choice[0]
-                        else:
-                            identifier = str(status_value)
-
-                        # Check for conflict
-                        if hasattr(cls, identifier):
-                            existing = getattr(cls, identifier)
-                            if not isinstance(existing, QueryManager):
-                                raise ImproperlyConfigured(
-                                    f"{cls.__name__} cannot define '{identifier}' as it "
-                                    "conflicts with StatusModel's automatic manager."
-                                )
-
-                        # Add the manager
-                        manager = QueryManager(status=status_value)
-                        manager.auto_created = True
-                        cls.add_to_class(identifier, manager)
-
     def save(self, *args: Any, **kwargs: Any) -> None:
         update_fields = kwargs.get('update_fields')
         if update_fields is not None:
@@ -167,6 +128,52 @@ class StatusModel(models.Model):
                 update_fields.add('status_changed')
                 kwargs['update_fields'] = list(update_fields)
         super().save(*args, **kwargs)
+
+
+def _add_status_managers(sender: type, **kwargs: Any) -> None:
+    """Add status managers for each status choice in StatusModel subclasses."""
+    if not issubclass(sender, StatusModel):
+        return
+    if sender._meta.abstract:
+        return
+
+    # Get STATUS from class
+    status_choices = getattr(sender, 'STATUS', None)
+    if status_choices is None:
+        return
+
+    # Iterate over choices
+    for choice in status_choices:
+        if isinstance(choice, tuple) and len(choice) >= 2:
+            # Get the status value (first element)
+            status_value = choice[0]
+            # For option groups, skip
+            if isinstance(choice[1], (list, tuple)) and not isinstance(choice[1], str):
+                continue
+            # Get the identifier (status value or second element for 3-tuples)
+            if len(choice) == 3:
+                identifier = str(choice[1])
+                status_value = choice[0]
+            else:
+                identifier = str(status_value)
+
+            # Check for conflict
+            if hasattr(sender, identifier):
+                existing = getattr(sender, identifier)
+                if not isinstance(existing, QueryManager):
+                    raise ImproperlyConfigured(
+                        f"{sender.__name__} cannot define '{identifier}' as it "
+                        "conflicts with StatusModel's automatic manager."
+                    )
+                continue  # Already has a QueryManager
+
+            # Add the manager
+            manager = QueryManager(status=status_value)
+            manager.auto_created = True
+            sender.add_to_class(identifier, manager)
+
+
+models.signals.class_prepared.connect(_add_status_managers)
 
 
 class SoftDeletableModel(models.Model):
