@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unittest
 from typing import TYPE_CHECKING
 from unittest import mock
 
@@ -224,6 +225,10 @@ class InheritanceManagerTests(TestCase):
 
         assert objs_1 == objs_2 == objs_3
 
+    @unittest.skipIf(
+        connection.vendor == 'sqlite',
+        "SQLite does not support chunked cursor"
+    )
     def test_plain_iterator_is_chunked(self) -> None:
         """
         Ensure that the iterator method of the queryset uses chunked cursor.
@@ -241,6 +246,10 @@ class InheritanceManagerTests(TestCase):
         cursor.assert_not_called()
         chunked_cursor.assert_called()
 
+    @unittest.skipIf(
+        connection.vendor == 'sqlite',
+        "SQLite does not support chunked cursor"
+    )
     def test_with_subclasses_iterator_is_chunked(self) -> None:
         """
         Ensure that the iterator method of the queryset uses chunked cursor

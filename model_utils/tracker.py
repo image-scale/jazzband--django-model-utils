@@ -95,19 +95,46 @@ class FieldInstanceTracker:
         self.saved_data: dict[str, Any] = {}
         self._context_stack: list[dict[str, Any]] = []
 
+    def _is_field_deferred(self, field: str) -> bool:
+        """Check if a field is deferred, handling both name and attname."""
+        deferred = self.instance.get_deferred_fields()
+        if field in deferred:
+            return True
+        # Check if the underlying field name is deferred (for attname tracking)
+        model_field = self.field_map.get(field)
+        if model_field and hasattr(model_field, 'name') and model_field.name in deferred:
+            return True
+        return False
+
     def get_field_value(self, field: str) -> Any:
         """Get the current value of a field."""
         if field in self.field_map:
             model_field = self.field_map[field]
-            # For FK fields accessed by name (not _id), avoid triggering a DB query
-            # by checking if the related object is cached in __dict__
+            # For FK fields, handle specially to avoid triggering unnecessary queries
             if model_field and hasattr(model_field, 'is_relation') and model_field.is_relation:
                 if model_field.many_to_one or model_field.one_to_one:
                     # Check if the object is cached (stored under field name in __dict__)
                     if field in self.instance.__dict__:
                         return self.instance.__dict__[field]
-                    # If not cached, return the FK id instead to avoid query
-                    return getattr(self.instance, model_field.attname, None)
+                    # Check if the field is actually deferred - if so, avoid query
+                    if self._is_field_deferred(field):
+                        # Return the ID if available, otherwise None
+                        if model_field.attname in self.instance.__dict__:
+                            return self.instance.__dict__[model_field.attname]
+                        return None
+                    # If ANY field is deferred, we're likely in a cascade situation
+                    # Avoid triggering queries that could cause loops
+                    if self.instance.get_deferred_fields():
+                        if model_field.attname in self.instance.__dict__:
+                            return self.instance.__dict__[model_field.attname]
+                        return None
+                    # For FieldInstanceTracker (not ModelInstanceTracker), prefer the ID
+                    # to avoid unnecessary queries
+                    if not isinstance(self, ModelInstanceTracker):
+                        if model_field.attname in self.instance.__dict__:
+                            return self.instance.__dict__[model_field.attname]
+                    # Field is not deferred, we can access it normally
+                    return getattr(self.instance, field)
             return getattr(self.instance, field)
         else:
             # It might be a property or attname (like fk_id)
@@ -122,9 +149,8 @@ class FieldInstanceTracker:
             if field not in self.fields:
                 continue
 
-            # Check if field is deferred
-            deferred = self.instance.get_deferred_fields()
-            if field in deferred:
+            # Check if field is deferred (handles both name and attname)
+            if self._is_field_deferred(field):
                 # Don't try to access deferred fields - wait until they're accessed
                 continue
 
@@ -147,9 +173,8 @@ class FieldInstanceTracker:
         if field not in self.fields:
             raise FieldError(f"'{field}' is not a tracked field")
 
-        # Check if field is deferred
-        deferred = self.instance.get_deferred_fields()
-        if field in deferred:
+        # Check if field is deferred (handles both name and attname)
+        if self._is_field_deferred(field):
             return False
 
         current = self.get_field_value(field)
@@ -163,14 +188,27 @@ class FieldInstanceTracker:
         if field not in self.fields:
             return None
 
-        # If field is deferred and we don't have saved data, fetch from DB
-        if field not in self.saved_data:
-            deferred = self.instance.get_deferred_fields()
-            if field in deferred and self.instance.pk:
-                # Fetch the value from database
+        # If field is not in saved_data and instance has pk, fetch from DB
+        if field not in self.saved_data and self.instance.pk:
+            # Check if field is still deferred (handles both name and attname)
+            if self._is_field_deferred(field):
+                # Fetch the value from database for deferred field
                 self.instance.refresh_from_db(fields=[field])
                 value = self.get_field_value(field)
                 self.saved_data[field] = _copy_field_value(value)
+            else:
+                # Field was never loaded or was assigned before accessing previous
+                # Need to fetch the original value from database using only() to avoid
+                # triggering tracker initialization
+                try:
+                    db_values = self.instance.__class__._default_manager.filter(
+                        pk=self.instance.pk
+                    ).values(field).first()
+                    if db_values:
+                        value = db_values[field]
+                        self.saved_data[field] = _copy_field_value(value)
+                except Exception:
+                    pass
 
         return self.saved_data.get(field)
 
@@ -178,8 +216,8 @@ class FieldInstanceTracker:
         """Return a dict of fields that have changed and their previous values."""
         result = {}
         for field in self.fields:
-            deferred = self.instance.get_deferred_fields()
-            if field in deferred:
+            # Check if field is deferred (handles both name and attname)
+            if self._is_field_deferred(field):
                 continue
             if field in self.saved_data:
                 current = self.get_field_value(field)
@@ -362,6 +400,11 @@ class FieldTracker:
     def _wrap_refresh_from_db(self, sender: type) -> None:
         """Wrap refresh_from_db to update tracker after refresh."""
         original_refresh = sender.refresh_from_db
+
+        # Don't wrap if already wrapped by this tracker or another
+        if hasattr(original_refresh, '_is_tracker_wrapped'):
+            return
+
         tracker_descriptor = self
 
         @functools.wraps(original_refresh)
@@ -377,6 +420,7 @@ class FieldTracker:
                     # All fields were refreshed
                     tracker.set_saved_fields()
 
+        refresh_from_db_wrapper._is_tracker_wrapped = True  # type: ignore
         sender.refresh_from_db = refresh_from_db_wrapper  # type: ignore
 
     def initialize_tracker(self, sender: models.Model, instance: models.Model, **kwargs: Any) -> None:
@@ -498,9 +542,8 @@ class ModelInstanceTracker(FieldInstanceTracker):
         if field not in self.fields:
             raise FieldError(f"'{field}' is not a tracked field")
 
-        # Check if field is deferred
-        deferred = self.instance.get_deferred_fields()
-        if field in deferred:
+        # Check if field is deferred (handles both name and attname)
+        if self._is_field_deferred(field):
             return False
 
         current = self.get_field_value(field)
@@ -519,8 +562,8 @@ class ModelInstanceTracker(FieldInstanceTracker):
 
         result = {}
         for field in self.fields:
-            deferred = self.instance.get_deferred_fields()
-            if field in deferred:
+            # Check if field is deferred (handles both name and attname)
+            if self._is_field_deferred(field):
                 continue
             if field in self.saved_data:
                 current = self.get_field_value(field)
