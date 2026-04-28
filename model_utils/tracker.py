@@ -165,20 +165,19 @@ class FieldInstanceTracker:
         return result
 
     def __enter__(self) -> FieldInstanceTracker:
-        # Save current saved_data state
-        self._context_stack.append(self.saved_data.copy())
+        # Save current saved_data state with None to indicate tracking all fields
+        self._context_stack.append((self.saved_data.copy(), None))
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         # Pop the saved state
         if self._context_stack:
-            popped_state = self._context_stack.pop()
+            popped_state, my_fields = self._context_stack.pop()
             if not self._context_stack:
                 # Outermost context exit - update baseline to current values
                 self.set_saved_fields()
-            else:
-                # Nested context exit - restore to state at context entry
-                self.saved_data = popped_state
+            # Nested context exit with no fields - don't update anything
+            # since parent context will handle it
 
     def __call__(self, *fields: str) -> FieldTrackerContextManager:
         """Return a context manager that tracks specific fields."""
@@ -194,26 +193,43 @@ class FieldTrackerContextManager:
         self._entered = False
 
     def __enter__(self) -> FieldTrackerContextManager:
-        # Push the current saved_data state to the stack
-        self.tracker._context_stack.append(self.tracker.saved_data.copy())
+        # Push the current saved_data state AND the fields we're tracking to the stack
+        self.tracker._context_stack.append((self.tracker.saved_data.copy(), self.fields))
         self._entered = True
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         if self.tracker._context_stack:
-            popped_state = self.tracker._context_stack.pop()
+            popped_state, my_fields = self.tracker._context_stack.pop()
+
             if not self.tracker._context_stack:
                 # Outermost context exit - update baseline to current values
-                if self.fields:
+                if my_fields:
                     # Only update specified fields
-                    for f in self.fields:
+                    for f in my_fields:
                         if f in self.tracker.fields:
                             self.tracker.saved_data[f] = _copy_field_value(self.tracker.get_field_value(f))
                 else:
                     self.tracker.set_saved_fields()
             else:
-                # Nested context exit - restore to state at context entry
-                self.tracker.saved_data = popped_state
+                # Nested context exit
+                if my_fields:
+                    # Find fields tracked ONLY by this context (not by parent contexts)
+                    parent_tracked_fields: set[str] = set()
+                    for _, parent_fields in self.tracker._context_stack:
+                        if parent_fields:
+                            parent_tracked_fields.update(parent_fields)
+                        else:
+                            # Parent tracks all fields
+                            parent_tracked_fields = self.tracker.fields.copy()
+                            break
+
+                    # Update baselines for fields unique to this context
+                    for f in my_fields:
+                        if f not in parent_tracked_fields and f in self.tracker.fields:
+                            self.tracker.saved_data[f] = _copy_field_value(self.tracker.get_field_value(f))
+                # If no fields specified in nested context, don't update anything (restore state)
+                # since parent context will handle it
 
 
 class FieldTracker:
@@ -292,12 +308,18 @@ class FieldTracker:
         """Initialize the tracker on a new instance."""
         tracker = self.__get__(instance, type(instance))
         if isinstance(tracker, FieldInstanceTracker):
-            tracker.set_saved_fields()
+            # Only set saved fields for existing instances (loaded from DB)
+            # For new instances, saved_data should be empty so previous() returns None
+            if instance.pk is not None:
+                tracker.set_saved_fields()
 
     def _post_save(self, sender: type, instance: models.Model, created: bool, update_fields: list[str] | frozenset[str] | None = None, **kwargs: Any) -> None:
         """Update saved_data after a save."""
         tracker = self.__get__(instance, type(instance))
         if isinstance(tracker, FieldInstanceTracker):
+            # Don't update saved_data if we're inside a context manager
+            if tracker._context_stack:
+                return
             if update_fields:
                 # Only update the saved fields that were actually saved
                 tracker.set_saved_fields(set(update_fields) & tracker.fields)
@@ -394,15 +416,12 @@ class ModelInstanceTracker(FieldInstanceTracker):
 
     def has_changed(self, field: str) -> bool:
         """Check if a field has changed since last save."""
-        if field not in self.fields:
-            # For ModelTracker, unknown fields are considered changed if instance is new
-            if self.instance.pk is None:
-                return True
-            return False
-
         # If instance is new (not yet saved), all fields are considered changed
         if self.instance.pk is None:
             return True
+
+        if field not in self.fields:
+            raise FieldError(f"'{field}' is not a tracked field")
 
         # Check if field is deferred
         deferred = self.instance.get_deferred_fields()

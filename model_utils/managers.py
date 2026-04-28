@@ -120,6 +120,13 @@ class InheritanceQuerySet(QuerySet[ModelT]):
                 return found
         return None
 
+    def get(self, *args: Any, **kwargs: Any) -> ModelT:
+        """Get an object and return it as its proper subclass instance if subclasses selected."""
+        result = super().get(*args, **kwargs)
+        if self.subclasses:
+            return self._get_subclass_instance(result)
+        return result
+
     def get_subclass(self, *args: Any, **kwargs: Any) -> ModelT:
         """Get an object and return it as its proper subclass instance."""
         return self.select_subclasses().get(*args, **kwargs)
@@ -128,20 +135,21 @@ class InheritanceQuerySet(QuerySet[ModelT]):
         """Filter to instances of specific subclasses."""
         new_qs = self._clone()
         q = Q()
+        related_names_to_select = []
         for model in models_list:
             if model == self.model:
                 continue
             related_name = self._get_related_name_for_model(model)
             if related_name:
-                # Filter using the parent link field
-                parts = related_name.split('__')
-                final_part = parts[-1]
-                # Get the pk field name for the related model
-                rel_opts = model._meta
-                pk_col = rel_opts.pk.column
-                lookup = f"{related_name}__{pk_col}__isnull"
+                related_names_to_select.append(related_name)
+                # Filter using the parent link field - check if related object exists
+                lookup = f"{related_name}__isnull"
                 q |= Q(**{lookup: False})
         new_qs = new_qs.filter(q)
+        # Also select the subclasses so results are converted
+        if related_names_to_select:
+            new_qs.subclasses = related_names_to_select
+            new_qs = new_qs.select_related(*related_names_to_select)
         return new_qs
 
     def _get_subclass_instance(self, obj: Any) -> Any:
@@ -289,8 +297,9 @@ class JoinQueryset(QuerySet[ModelT]):
     def join(self, qs: QuerySet[Any] | None = None) -> JoinQueryset[ModelT]:
         """Filter this queryset based on another queryset using a join."""
         if qs is None:
-            # Self-join - just return a clone
-            return self._clone()  # type: ignore
+            # Self-join - materialize current queryset PKs and filter by them
+            pks = list(self.values_list('pk', flat=True))
+            return self.model._default_manager.filter(pk__in=pks)  # type: ignore
 
         # Find the relationship between the two models
         other_model = qs.model

@@ -234,6 +234,19 @@ class StatusField(models.CharField):
         if self.default is NOT_PROVIDED:
             self.default = self.choices[0][0]
 
+        # Create get_FIELD_display method since Django doesn't do it automatically
+        # for dynamically set choices
+        def make_get_display(field_name: str, choices: list[Any]) -> Callable[[Any], str]:
+            def get_display(obj: Any) -> str:
+                value = getattr(obj, field_name)
+                choices_dict = {k: v for k, v in choices}
+                return choices_dict.get(value, str(value))
+            return get_display
+
+        display_method_name = f'get_{self.name}_display'
+        if not hasattr(sender, display_method_name):
+            setattr(sender, display_method_name, make_get_display(self.name, self.choices))
+
     def contribute_to_class(self, cls: type, name: str, private_only: bool = False, **kwargs: Any) -> None:
         super().contribute_to_class(cls, name, private_only=private_only, **kwargs)
         models.signals.class_prepared.connect(self._prepare_class, sender=cls)

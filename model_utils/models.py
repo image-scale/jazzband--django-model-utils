@@ -109,8 +109,12 @@ class TimeFramedModel(models.Model):
         abstract = True
 
 
-class TimeFramedManager(models.Manager['TimeFramedModel']):
+class TimeFramedManager(QueryManager['TimeFramedModel']):
     """Manager that filters to timeframed items (start <= now <= end)."""
+
+    def __init__(self) -> None:
+        # Don't pass Q objects to super - we'll handle filtering dynamically
+        super().__init__()
 
     def get_queryset(self) -> models.QuerySet['TimeFramedModel']:
         now = timezone.now()
@@ -210,6 +214,15 @@ def _add_status_managers(sender: type, **kwargs: Any) -> None:
             manager = QueryManager(status=status_value)
             manager.auto_created = True
             sender.add_to_class(identifier, manager)
+
+    # Ensure the default manager is 'objects' if it exists and isn't auto-created
+    # This prevents auto-generated status managers from becoming the default
+    if sender._meta.default_manager_name is None:
+        # Look for an explicitly defined 'objects' manager
+        for manager in sender._meta.managers:
+            if manager.name == 'objects' and not getattr(manager, 'auto_created', False):
+                sender._meta.default_manager_name = 'objects'
+                break
 
 
 models.signals.class_prepared.connect(_add_status_managers)
