@@ -239,7 +239,7 @@ class StatusField(models.CharField):
 class UUIDField(models.UUIDField):
     """A UUIDField that auto-generates UUIDs with configurable version."""
 
-    def __init__(self, version: int = 4, **kwargs: Any) -> None:
+    def __init__(self, verbose_name: str | None = None, version: int = 4, **kwargs: Any) -> None:
         from django.core.exceptions import ValidationError
 
         if version not in (1, 3, 4, 5):
