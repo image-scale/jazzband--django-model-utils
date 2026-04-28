@@ -86,8 +86,8 @@ class InheritanceQuerySet(QuerySet[ModelT]):
         for rel in opts.related_objects:
             if not rel.one_to_one:
                 continue
-            field = rel.field
-            if not getattr(field, 'parent_link', False):
+            # Check parent_link on the relation object itself
+            if not getattr(rel, 'parent_link', False):
                 continue
             related_model = rel.related_model
             related_name = rel.get_accessor_name()
@@ -106,8 +106,8 @@ class InheritanceQuerySet(QuerySet[ModelT]):
         for rel in opts.related_objects:
             if not rel.one_to_one:
                 continue
-            field = rel.field
-            if not getattr(field, 'parent_link', False):
+            # Check parent_link on the relation object itself
+            if not getattr(rel, 'parent_link', False):
                 continue
             related_model = rel.related_model
             related_name = rel.get_accessor_name()
