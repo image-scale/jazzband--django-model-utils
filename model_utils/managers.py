@@ -149,9 +149,17 @@ class InheritanceQuerySet(QuerySet[ModelT]):
         if not isinstance(obj, models.Model):
             return obj
 
-        for subclass_name in self.subclasses:
+        # Sort subclasses by depth (deepest first) to get the most specific type
+        # e.g., 'child1__grandchild1' should be checked before 'child1'
+        sorted_subclasses = sorted(self.subclasses, key=lambda x: -x.count('__'))
+
+        best_match = obj
+        best_depth = 0
+
+        for subclass_name in sorted_subclasses:
             current = obj
             parts = subclass_name.split('__')
+            depth = len(parts)
             for part in parts:
                 try:
                     current = getattr(current, part, None)
@@ -161,13 +169,18 @@ class InheritanceQuerySet(QuerySet[ModelT]):
                     current = None
                     break
             if current is not None and isinstance(current, models.Model):
-                # Copy extras from the original object
-                if hasattr(obj, '__dict__'):
-                    for key, value in obj.__dict__.items():
-                        if not key.startswith('_') and not hasattr(current, key):
-                            setattr(current, key, value)
-                return current
-        return obj
+                # Found a valid subclass - use if it's deeper than current best
+                if depth > best_depth:
+                    best_match = current
+                    best_depth = depth
+
+        # Copy extras from the original object to best match
+        if best_match is not obj and hasattr(obj, '__dict__'):
+            for key, value in obj.__dict__.items():
+                if not key.startswith('_') and not hasattr(best_match, key):
+                    setattr(best_match, key, value)
+
+        return best_match
 
     def iterator(self, chunk_size: int | None = None) -> Any:
         """Return an iterator over the results."""
