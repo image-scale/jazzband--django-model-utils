@@ -31,6 +31,27 @@ class AutoLastModifiedField(models.DateTimeField):
         super().__init__(*args, **kwargs)
 
     def pre_save(self, model_instance: models.Model, add: bool) -> datetime:
+        # Check if this field was explicitly set (different from default)
+        # by checking the _auto_now_override attribute
+        if add:
+            # First save - allow override if value was explicitly set
+            # Check for explicit override marker
+            override_marker = f'_override_{self.attname}'
+            if getattr(model_instance, override_marker, False):
+                # Value was explicitly set - use it
+                delattr(model_instance, override_marker)
+                return getattr(model_instance, self.attname)
+            # Otherwise use created value if available to ensure equality
+            created_field = None
+            for field in model_instance._meta.fields:
+                if isinstance(field, AutoCreatedField):
+                    created_field = field
+                    break
+            if created_field:
+                created_value = getattr(model_instance, created_field.attname)
+                setattr(model_instance, self.attname, created_value)
+                return created_value
+        # Normal case - update to current time
         value = timezone.now()
         setattr(model_instance, self.attname, value)
         return value
@@ -45,28 +66,35 @@ class TimeStampedModel(models.Model):
     class Meta:
         abstract = True
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # Check if 'modified' was explicitly passed
+        if 'modified' in kwargs:
+            self._override_modified = True
+        if 'created' in kwargs:
+            self._override_created = True
+        super().__init__(*args, **kwargs)
+
     def save(self, *args: Any, **kwargs: Any) -> None:
         # Handle update_fields
         update_fields = kwargs.get('update_fields')
 
-        # If saving for the first time
+        # Check for empty update_fields (skip save case)
+        if update_fields is not None and len(update_fields) == 0:
+            # Empty update_fields means no actual save - bypass completely
+            return
+
+        # If this is the first save and created was explicitly set
+        # but modified was not, set modified to match created
         if not self.pk:
-            # For new objects, allow setting created and modified manually
-            # but if modified is not set, use created value
-            if self.created and not self.modified:
+            if hasattr(self, '_override_created') and not hasattr(self, '_override_modified'):
+                self._override_modified = True
                 self.modified = self.created
-        else:
-            # For existing objects, always update modified
-            # unless update_fields is empty (which means skip the save entirely)
-            if update_fields is not None:
-                if len(update_fields) == 0:
-                    # Empty update_fields means no actual save
-                    super().save(*args, **kwargs)
-                    return
-                # Add 'modified' to update_fields
-                update_fields = set(update_fields)
-                update_fields.add('modified')
-                kwargs['update_fields'] = list(update_fields)
+
+        # For existing objects with update_fields, ensure modified is included
+        if self.pk and update_fields is not None:
+            update_fields = set(update_fields)
+            update_fields.add('modified')
+            kwargs['update_fields'] = list(update_fields)
 
         super().save(*args, **kwargs)
 
